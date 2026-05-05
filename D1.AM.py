@@ -24,7 +24,7 @@ class AgentState(TypedDict):
 search = DuckDuckGoSearchRun()
 
 def planner(state: AgentState) -> AgentState:
-    system = """You are a planning agent. Break the usre's goal into at most 5 concrete tasks. Return only with a valid JSON array of strting. No preamable, no markdown."""
+    system = """You are a planning agent. Break the user's goal into at most 5 concrete tasks. Return only with a valid JSON array of strings. No preamble, no markdown."""
 
     message = [
         SystemMessage(content=system),
@@ -71,14 +71,58 @@ def executor(state: AgentState) -> AgentState:
 
     return {**state, "results": results , "iterations": state["iterations"] + 1}
 
+
+def verifier(state: AgentState) -> AgentState:
+    # safety net - approve after 3 iterations regardless
+    if state["iterations"] >= 3:
+        print("[Verifier] Max iterations reached - force approving.")
+        return {**state, "approved": True}
+
+    combined_results = "\n\n".join(
+        f"Task {i+1}: {t}\nResult: {r}"
+        for i, (t, r) in enumerate(zip(state["tasks"], state["results"]))
+    )
+    system = """You are a quality verifier. Evaluate the results against the original goal using this rubric:
+Completeness: Does it fully address the goal? (0-0.4)
+Accuracy: Is the information correct and specific? (0-0.3)
+Clarity: Is it well-structured and clear? (0-0.3)
+Sum the scores for a total between 0.0 and 1.0.
+Respond ONLY as JSON: {"score": 0.85, "approved": true, "critique": "..."}"""
+    messages = [
+        SystemMessage(content=system),
+        HumanMessage(content=f"Original goal: {state['goal']}\n\nResults: \n{combined_results}")
+    ]
+    try:
+        raw = llm.invoke(messages).content.strip()
+        clean = raw.replace("```json", "").replace("```", "").strip()
+        verdict = json.loads(clean)
+        approved = verdict.get("approved", False)
+        critique = verdict.get("critique", "")
+        score = verdict.get("score", 0)
+    except:
+        approved, critique, score = False, raw, 0
+
+    
+    print(f"\n[Verifier] Score: {score:.2f} | Approved: {approved}")
+    return {**state, "approved": approved, "critique": critique}
+
+
+
+
+
+
+
+
 graph = StateGraph(AgentState)
 
 graph.add_node("planner", planner)
 graph.add_node("executor", executor)
+graph.add_node("verifier", verifier)
 
 graph.add_edge(START, "planner")
 graph.add_edge("planner", "executor")
-graph.add_edge("executor", END)
+graph.add_edge("executor", "verifier")
+graph.add_conditional_edges("verifier", lambda state: END if state["approved"] else "planner")
 app = graph.compile()
 # - run it —
 initial_state: AgentState = {
